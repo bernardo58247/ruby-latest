@@ -1,62 +1,91 @@
-name: build ruby-latest
+name: Build latest Ruby
 
 on:
-  schedule:
-    # verifica diariamente às 00:00 UTC
-    - cron: "0 0 * * *"
-
-  workflow_dispatch:
-
   push:
     branches:
       - main
 
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 6 * * *"
+
+
 permissions:
   contents: write
 
+
+env:
+  RUBY_MIRROR: https://cache.ruby-lang.org/pub/ruby
+
+
 jobs:
+
+  # ============================================================
+  # descobrir a versão mais recente do Ruby
+  # ============================================================
+
   check-version:
-    name: verificar versão do ruby
-    runs-on: ubuntu-latest
+    name: Detect latest Ruby
+    runs-on: ubuntu-24.04
 
     outputs:
       version: ${{ steps.version.outputs.version }}
-      exists: ${{ steps.version.outputs.exists }}
+      should_build: ${{ steps.version.outputs.should_build }}
 
     steps:
-      - name: descobrir versão mais recente
+      - name: Find latest stable Ruby
         id: version
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          version="$(
+          echo "Procurando a versão mais recente do Ruby..."
+
+          VERSION="$(
             curl -fsSL https://www.ruby-lang.org/en/downloads/ |
-            grep -oE 'Ruby [0-9]+\.[0-9]+\.[0-9]+' |
-            head -n 1 |
-            grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
+            grep -oE 'ruby-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' |
+            sed 's/^ruby-//' |
+            sed 's/\.tar\.gz$//' |
+            sort -V |
+            tail -n 1
           )"
 
-          echo "ruby mais recente: $version"
-
-          if git ls-remote --exit-code \
-            "https://github.com/${GITHUB_REPOSITORY}.git" \
-            "refs/tags/ruby-$version" >/dev/null 2>&1
-          then
-            echo "essa versão já foi publicada"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "nova versão encontrada!"
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$VERSION" ]; then
+            echo "Não foi possível descobrir a versão do Ruby."
+            exit 1
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Ruby encontrado: $VERSION"
 
-  build:
-    name: build ${{ matrix.libc }} ${{ matrix.arch }}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code \
+              "https://github.com/${GITHUB_REPOSITORY}.git" \
+              "refs/tags/ruby-$VERSION" >/dev/null 2>&1; then
+
+            echo "ruby-$VERSION já existe."
+
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "ruby-$VERSION ainda não foi publicado."
+
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+          fi
+
+
+  # ============================================================
+  # Ruby glibc
+  # ============================================================
+
+  build-glibc:
+    name: Ruby ${{ needs.check-version.outputs.version }} / ${{ matrix.arch }} / glibc
     needs: check-version
 
-    if: needs.check-version.outputs.exists == 'false'
+    if: needs.check-version.outputs.should_build == 'true'
 
     strategy:
       fail-fast: false
@@ -64,282 +93,537 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            libc: glibc
             runner: ubuntu-24.04
+            deb_arch: amd64
+            rpm_arch: x86_64
 
           - arch: aarch64
-            libc: glibc
             runner: ubuntu-24.04-arm
-
-          - arch: x86_64
-            libc: musl
-            runner: ubuntu-24.04
-
-          - arch: aarch64
-            libc: musl
-            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+            rpm_arch: aarch64
 
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - name: instalar dependências
+
+      - name: Install build dependencies
         run: |
+          set -eux
+
           sudo apt-get update
 
           sudo apt-get install -y \
             build-essential \
             autoconf \
             bison \
-            curl \
-            ca-certificates \
             libssl-dev \
             libyaml-dev \
             libreadline-dev \
             zlib1g-dev \
-            libncurses-dev \
+            libncurses5-dev \
             libffi-dev \
             libgdbm-dev \
-            libdb-dev
+            libdb-dev \
+            wget \
+            curl \
+            tar \
+            gzip \
+            dpkg-dev \
+            rpm
 
-      - name: instalar musl
-        if: matrix.libc == 'musl'
-        run: |
-          sudo apt-get install -y musl-tools
-
-      - name: baixar ruby
+      - name: Download Ruby
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          set -e
+          set -eux
 
-          major_minor="${VERSION%.*}"
+          MAJOR_MINOR="${VERSION%.*}"
 
-          curl -fLO \
-            "https://cache.ruby-lang.org/pub/ruby/${major_minor}/ruby-${VERSION}.tar.gz"
+          wget \
+            "${RUBY_MIRROR}/${MAJOR_MINOR}/ruby-${VERSION}.tar.gz"
 
-          tar xf "ruby-${VERSION}.tar.gz"
+          tar -xf "ruby-${VERSION}.tar.gz"
 
-      - name: configurar
+      - name: Configure Ruby
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
-        working-directory: ruby-${{ needs.check-version.outputs.version }}
         run: |
+          set -eux
+
+          cd "ruby-${VERSION}"
+
+          autoconf
+
           ./configure \
-            --prefix=/opt/ruby \
+            --prefix=/opt/ruby/${VERSION} \
+            --enable-shared \
             --disable-install-doc
 
-      - name: compilar
+      - name: Build Ruby
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
-        working-directory: ruby-${{ needs.check-version.outputs.version }}
         run: |
+          set -eux
+
+          cd "ruby-${VERSION}"
+
           make -j"$(nproc)"
 
-      - name: instalar em staging
-        env:
-          VERSION: ${{ needs.check-version.outputs.version }}
-        working-directory: ruby-${{ needs.check-version.outputs.version }}
-        run: |
-          make DESTDIR="$GITHUB_WORKSPACE/pkg" install
-
-      - name: testar ruby
-        run: |
-          ./pkg/opt/ruby/bin/ruby --version
-
-      - name: criar tarball
+      - name: Test Ruby
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
+          set -eux
+
+          cd "ruby-${VERSION}"
+
+          make -j"$(nproc)" check
+
+      - name: Install into staging directory
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -eux
+
+          cd "ruby-${VERSION}"
+
+          rm -rf "$GITHUB_WORKSPACE/stage"
+
+          make \
+            DESTDIR="$GITHUB_WORKSPACE/stage" \
+            install
+
+      # ----------------------------------------------------------
+      # tar.gz
+      # ----------------------------------------------------------
+
+      - name: Create tarball
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -eux
+
           mkdir -p dist
 
-          tar -C pkg \
+          tar -C stage \
             -czf \
-            "dist/ruby-${VERSION}-linux-${{ matrix.arch }}-${{ matrix.libc }}.tar.gz" \
+            "dist/ruby-${VERSION}-linux-${{ matrix.arch }}-glibc.tar.gz" \
             opt
 
-      - name: criar deb
+      # ----------------------------------------------------------
+      # DEB
+      # ----------------------------------------------------------
+
+      - name: Create DEB
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          mkdir -p deb/DEBIAN
-          mkdir -p deb/opt
+          set -eux
 
-          cp -a pkg/opt/ruby deb/opt/
+          rm -rf deb
+
+          mkdir -p \
+            "deb/opt/ruby/${VERSION}" \
+            "deb/DEBIAN"
+
+          cp -a \
+            "stage/opt/ruby/${VERSION}/." \
+            "deb/opt/ruby/${VERSION}/"
 
           cat > deb/DEBIAN/control <<EOF
           Package: ruby-latest
           Version: ${VERSION}
-          Section: interpreters
+          Section: devel
           Priority: optional
-          Architecture: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
+          Architecture: ${{ matrix.deb_arch }}
           Maintainer: ruby-latest
-          Description: Ruby compiled from source
-           Latest Ruby release compiled by ruby-latest.
+          Description: Ruby ${VERSION} compiled from source
           EOF
 
-          dpkg-deb --build deb \
+          dpkg-deb \
+            --build \
+            --root-owner-group \
+            deb \
             "dist/ruby-${VERSION}-${{ matrix.arch }}.deb"
 
-      - name: instalar ferramentas rpm
-        run: |
-          sudo apt-get install -y rpm
+      # ----------------------------------------------------------
+      # RPM
+      # ----------------------------------------------------------
 
-      - name: criar rpm
+      - name: Create RPM
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          set -eux
 
-          tar -czf \
+          rm -rf rpmbuild
+
+          mkdir -p \
+            rpmbuild/BUILD \
+            rpmbuild/BUILDROOT \
+            rpmbuild/RPMS \
+            rpmbuild/SOURCES \
+            rpmbuild/SPECS \
+            rpmbuild/SRPMS
+
+          tar \
+            -C stage \
+            -czf \
             "rpmbuild/SOURCES/ruby-${VERSION}.tar.gz" \
-            -C pkg opt
+            opt
 
-          cat > rpmbuild/SPECS/ruby-latest.spec <<EOF
-          Name: ruby-latest
-          Version: ${VERSION}
-          Release: 1
-          Summary: Ruby compiled from source
-          License: Ruby
-          BuildArch: ${{ matrix.arch == 'x86_64' && 'x86_64' || 'aarch64' }}
+          cat > "rpmbuild/SPECS/ruby-latest.spec" <<EOF
+          Name:           ruby-latest
+          Version:        ${VERSION}
+          Release:        1
+          Summary:        Ruby ${VERSION} compiled from source
+          License:        Ruby
+          BuildArch:      ${{ matrix.rpm_arch }}
+
+          Source0:        ruby-${VERSION}.tar.gz
 
           %description
-          Latest Ruby release compiled from source.
+          Ruby ${VERSION} compiled from source.
 
           %prep
-
-          %build
+          %setup -q -c -T
+          tar -xzf %{_sourcedir}/ruby-${VERSION}.tar.gz
 
           %install
+          rm -rf %{buildroot}
+
           mkdir -p %{buildroot}/opt
-          cp -a %{_sourcedir}/../opt/ruby %{buildroot}/opt/
+
+          cp -a opt/ruby/${VERSION} \
+            %{buildroot}/opt/ruby-${VERSION}
+
+          mkdir -p %{buildroot}/opt/ruby
+
+          mv \
+            %{buildroot}/opt/ruby-${VERSION} \
+            %{buildroot}/opt/ruby/${VERSION}
 
           %files
-          /opt/ruby
+          /opt/ruby/${VERSION}
+
+          %changelog
+          * Mon Jan 01 2026 ruby-latest
+          - Automated Ruby ${VERSION} build
           EOF
 
           rpmbuild \
             --define "_topdir $PWD/rpmbuild" \
-            -bb rpmbuild/SPECS/ruby-latest.spec
+            -bb \
+            "rpmbuild/SPECS/ruby-latest.spec"
 
           find rpmbuild/RPMS \
             -type f \
-            -name '*.rpm' \
+            -name "*.rpm" \
             -exec cp {} dist/ \;
 
-      - name: enviar artefatos
+      - name: Upload glibc artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ruby-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}-${{ matrix.libc }}
-          path: dist/
+          name: ruby-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}-glibc
+          path: dist/*
 
-  alpine:
-    name: pacote alpine
+
+  # ============================================================
+  # Ruby MUSL / Alpine
+  #
+  # IMPORTANTE:
+  # o build inteiro acontece dentro do Alpine.
+  # abuild roda como "builder", nunca como root.
+  # ============================================================
+
+  build-alpine:
+    name: Ruby ${{ needs.check-version.outputs.version }} / Alpine / ${{ matrix.arch }}
     needs: check-version
 
-    if: needs.check-version.outputs.exists == 'false'
+    if: needs.check-version.outputs.should_build == 'true'
 
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
 
     container:
       image: alpine:latest
 
     steps:
-      - name: instalar ferramentas
+
+      - name: Install Alpine build system
         run: |
+          set -eux
+
+          apk update
+
           apk add --no-cache \
             alpine-sdk \
             bash \
+            build-base \
+            autoconf \
+            bison \
+            openssl-dev \
+            yaml-dev \
+            readline-dev \
+            zlib-dev \
+            ncurses-dev \
+            libffi-dev \
+            gdbm-dev \
+            db-dev \
+            linux-headers \
             curl \
+            wget \
             tar \
-            xz
+            gzip \
+            sudo
 
-      - name: baixar ruby
-        env:
-          VERSION: ${{ needs.check-version.outputs.version }}
+      - name: Create non-root abuild user
         run: |
-          major_minor="${VERSION%.*}"
+          set -eux
 
-          curl -fLO \
-            "https://cache.ruby-lang.org/pub/ruby/${major_minor}/ruby-${VERSION}.tar.gz"
+          addgroup -S abuild 2>/dev/null || true
 
-      - name: compilar ruby
-        env:
-          VERSION: ${{ needs.check-version.outputs.version }}
-        run: |
-          tar xf "ruby-${VERSION}.tar.gz"
-          cd "ruby-${VERSION}"
+          adduser \
+            -S \
+            -D \
+            -h /home/builder \
+            -s /bin/ash \
+            builder
 
-          ./configure \
-            --prefix=/usr \
-            --disable-install-doc
-
-          make -j"$(nproc)"
+          addgroup builder abuild
 
           mkdir -p \
-            "$GITHUB_WORKSPACE/pkg/usr"
+            /home/builder/packages \
+            /home/builder/src
 
-          make \
-            DESTDIR="$GITHUB_WORKSPACE/pkg" \
-            install
+          chown -R \
+            builder:abuild \
+            /home/builder
 
-      - name: criar apk
+      - name: Configure abuild
+        run: |
+          set -eux
+
+          su builder -s /bin/ash -c '
+            cd /home/builder
+
+            abuild-keygen \
+              -a \
+              -n
+          '
+
+      - name: Download Ruby
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/dist"
+          set -eux
 
-          cat > APKBUILD <<EOF
+          MAJOR_MINOR="${VERSION%.*}"
+
+          su builder -s /bin/ash -c "
+            cd /home/builder/src
+
+            wget \
+              '${RUBY_MIRROR}/${MAJOR_MINOR}/ruby-${VERSION}.tar.gz'
+
+            tar -xf \
+              'ruby-${VERSION}.tar.gz'
+          "
+
+      - name: Build Ruby with musl
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -eux
+
+          su builder -s /bin/ash -c "
+            cd /home/builder/src/ruby-${VERSION}
+
+            autoconf
+
+            ./configure \
+              --prefix=/usr \
+              --enable-shared \
+              --disable-install-doc
+
+            make -j\$(getconf _NPROCESSORS_ONLN)
+
+            make \
+              DESTDIR=/home/builder/pkg \
+              install
+          "
+
+      - name: Create APKBUILD
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -eux
+
+          mkdir -p /home/builder/ruby-package
+
+          chown \
+            -R builder:abuild \
+            /home/builder/ruby-package
+
+          cat > /home/builder/ruby-package/APKBUILD <<EOF
           # Maintainer: ruby-latest
+
           pkgname=ruby-latest
           pkgver=${VERSION}
-          pkgrel=0
-          pkgdesc="Ruby compiled from source"
+          pkgrel=1
+
+          pkgdesc="Ruby ${VERSION} compiled from source"
           url="https://www.ruby-lang.org/"
-          arch="aarch64 x86_64"
-          license="BSD-2-Clause"
+          arch="all"
+          license="Ruby"
+
           options="!check"
 
           package() {
-              cp -a "$GITHUB_WORKSPACE/pkg/usr" "\$pkgdir/"
+              mkdir -p "\$pkgdir/usr"
+
+              cp -a \
+                  /home/builder/pkg/usr/. \
+                  "\$pkgdir/usr/"
           }
           EOF
 
-          abuild-keygen -a -n
+          chown \
+            builder:abuild \
+            /home/builder/ruby-package/APKBUILD
 
-          abuild checksum
-          abuild -r
+      - name: Build APK as non-root
+        run: |
+          set -eux
 
-          find /home -name '*.apk' \
-            -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
+          su builder -s /bin/ash -c '
+            cd /home/builder/ruby-package
 
-      - name: enviar apk
+            abuild checksum
+
+            abuild -r
+          '
+
+      - name: Collect APK
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -eux
+
+          mkdir -p dist
+
+          find /home/builder/packages \
+            -type f \
+            -name "*.apk" \
+            -exec cp {} dist/ \;
+
+          find dist \
+            -type f \
+            -name "*.apk" \
+            -print
+
+      - name: Create musl tarball
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -eux
+
+          tar \
+            -C /home/builder/pkg \
+            -czf \
+            "dist/ruby-${VERSION}-linux-${{ matrix.arch }}-musl.tar.gz" \
+            usr
+
+      - name: Upload Alpine artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ruby-${{ needs.check-version.outputs.version }}-apk
-          path: dist/
+          name: ruby-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}-musl
+          path: dist/*
+
+
+  # ============================================================
+  # RELEASE
+  # ============================================================
 
   release:
-    name: criar github release
+    name: Create GitHub Release
     needs:
       - check-version
-      - build
-      - alpine
+      - build-glibc
+      - build-alpine
 
-    if: needs.check-version.outputs.exists == 'false'
+    if: needs.check-version.outputs.should_build == 'true'
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: baixar artefatos
+
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: release
 
-      - name: criar tag e release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ruby-${{ needs.check-version.outputs.version }}
-          name: Ruby ${{ needs.check-version.outputs.version }}
-          generate_release_notes: true
-          files: |
-            release/**/*
+      - name: Flatten artifacts
+        run: |
+          set -eux
+
+          mkdir -p dist
+
+          find release \
+            -type f \
+            \( \
+              -name "*.tar.gz" \
+              -o -name "*.deb" \
+              -o -name "*.rpm" \
+              -o -name "*.apk" \
+            \) \
+            -exec cp {} dist/ \;
+
+          echo "Arquivos que serão publicados:"
+          find dist -type f -print
+
+      - name: Create tag
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -eux
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag \
+            -a \
+            "ruby-${VERSION}" \
+            -m \
+            "Ruby ${VERSION}"
+
+          git push origin \
+            "ruby-${VERSION}"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -eux
+
+          gh release create \
+            "ruby-${VERSION}" \
+            dist/* \
+            --title "Ruby ${VERSION}" \
+            --generate-notes
