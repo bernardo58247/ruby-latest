@@ -410,7 +410,7 @@ jobs:
             builder:abuild \
             /home/builder
 
-      - name: Configure abuild
+            - name: Configure abuild
         run: |
           set -eux
 
@@ -421,6 +421,18 @@ jobs:
               -a \
               -n
           '
+
+          # instala a chave pública no trust store do apk
+          cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
+
+          chmod 644 /etc/apk/keys/*.rsa.pub
+
+          echo "=== chaves do abuild ==="
+          ls -l /home/builder/.abuild/
+
+          echo "=== chaves confiáveis pelo apk ==="
+          ls -l /etc/apk/keys/
+         ,
 
       - name: Download Ruby
         env:
